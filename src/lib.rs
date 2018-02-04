@@ -1,212 +1,160 @@
-#![feature(macro_vis_matcher)]
-
+#[doc(hidden)]
 pub extern crate futures;
 
-pub trait Facade: Send + Sync + 'static {
-    // TODO?
-    // type Call
-    // fn send_call(
-    // fn gateway_closed(&self) -> bool;
+use futures::prelude::*;
+use futures::sync::{mpsc, oneshot};
+use std::error::Error;
+
+#[derive(Debug)]
+pub enum CallError {
+    /// Fault lies somewhere within the currently running program.
+    Local(Box<Error + Send + Sync>),
+    /// Fault lies with a third party/the environment interfering somehow.
+    Connection(Box<Error + Send + Sync>),
+    /// Fault lies with the remote endpoint.
+    Remote(Box<Error + Send + Sync>),
 }
 
-/// TODO Error-type?
-pub type Future<T> =
-    Box<futures::Future<Item = T, Error = futures::sync::oneshot::Canceled> + Send>;
-pub type OneshotTx<T> = futures::sync::oneshot::Sender<T>;
-pub type OneshotRx<T> = futures::sync::oneshot::Receiver<T>;
+// TODO 
+pub type OneshotTx<R> = oneshot::Sender<R>;
+// TODO Naming? 
+pub type OneshotRx<R> = Box<Future<Item = R, Error = CallError> + Send>;
 
-// #[doc(hidden)]
+/// TODO remove this completely?
+pub trait Interface<Call, Ret>: Send + Sync + 'static
+    where Call: Send + 'static, Ret: Send + 'static
+{
+    // FIXME
+    // type Return: Send + 'static;
+
+    fn forward_call(&self, call: Call, ret: OneshotTx<Ret>);
+
+    fn start_call(&self, call: Call) -> OneshotRx<Ret> {
+        let (ret_tx, ret_rx) = oneshot::channel();
+        self.forward_call(call, ret_tx);
+        Box::new(ret_rx.map_err(|e| CallError::Local(Box::new(e))))
+    }
+}
+
+// TODO?
+// pub trait Backend<Call, Ret> {
+//     fn complete_call(&mut self, call: Call) -> Ret;
+// }
+
+// ++++++++++++++++++++ unbounded ++++++++++++++++++++
+
+pub struct UnboundedSender<Call, Ret> {
+    tx: mpsc::UnboundedSender<(Call, OneshotTx<Ret>)>,
+}
+
+impl<Call, Ret> Clone for UnboundedSender<Call, Ret> 
+    where Call: Send + 'static, Ret: Send + 'static
+{
+    fn clone(&self) -> Self {
+        Self{ tx: self.tx.clone() }
+    }
+}
+
+impl<Call, Ret> Interface<Call, Ret> for UnboundedSender<Call, Ret> 
+    where Call: Send + 'static, Ret: Send + 'static
+{
+    fn forward_call(&self, call: Call, ret: OneshotTx<Ret>){
+        let _ = self.tx.unbounded_send((call, ret)); // TODO? handle err
+    }
+}
+
+// TODO
+pub type UnboundedReceiver<Call, Ret> = mpsc::UnboundedReceiver<(Call, OneshotTx<Ret>)>;
+
+pub fn unbounded<Call, Ret>() -> (UnboundedSender<Call, Ret>, UnboundedReceiver<Call, Ret>) 
+    where Call: Send + 'static, Ret: Send + 'static
+{
+    let (tx, rx) = mpsc::unbounded();
+    (UnboundedSender{ tx }, rx)
+}
+
 #[macro_export]
-macro_rules! _api_facades {
-    (@invoke_each [$($macs:ident),*] $body:tt) => {
-        $($macs! $body)*
-    };
-
-    (/* @toplevel */ [] []) => {};
-
-    (/* @toplevel */ [$($attrs:meta),*] [$($gen_macs:ident),*]
-        #[gen($($next_gen_macs:ident),+ $(,)*)] 
-        $($rest:tt)+
-    ) => {
-        _api_facades!{ /* @toplevel */ [$($attrs),*] [$($gen_macs,)* $($next_gen_macs),+]
-            $($rest)+
-        }
-    };
-
-    (/* @toplevel */ [$($attrs:meta),*] [$($gen_macs:ident),*]
-        #[$next_attr:meta] 
-        $($rest:tt)+
-    ) => {
-        _api_facades!{ /* @toplevel */ [$($attrs,)* $next_attr] [$($gen_macs),*]
-            $($rest)+
-        }
-    };
-
-    (/* @toplevel */ [$($attrs:meta),*] [$($gen_macs:ident),*]
-        $vis:vis facade $module:ident :: $facade:ident $(<$($ty_params:ident),+ $(,)*>)* 
+macro_rules! api_bridges {
+    // TODO remove parenthesis-workaround in `where ()`
+    ($(
+        $(#[$attrs:meta])*
+        $(@[mod_attrs($($mod_attrs:meta),* $(,)*)])*
+        $(@[call_attrs($($call_attrs:meta),* $(,)*)])*
+        $(@[return_attrs($($return_attrs:meta),* $(,)*)])*
+        $(@[data_attrs($($data_attrs:meta),* $(,)*)])*
+        $(@[backend_attrs($($backend_attrs:meta),* $(,)*)])*
+        intf $mod:ident :: $intf:ident $(<$($ty_params:ident),+>)*
             $(where ($($ty_bounds:tt)+))*
-        { 
-            $(
-                $(#[$method_attrs:meta])* 
-                fn $methods:ident($($args:ident: $arg_tys:ty),* $(,)*) $(-> $ret_tys:ty)*;
-            )*
-        } 
-        $($rest:tt)*
-    ) => {
-        #[allow(unused)]
-        $vis mod $module {
-            use super::*;
+        {$(
+            $(#[$m_attrs:meta])*
+            $(@[call_attrs($($m_call_attrs:meta),* $(,)*)])*
+            $(@[return_attrs($($m_return_attrs:meta),* $(,)*)])*
+            $(@[data_attrs($($m_data_attrs:meta),* $(,)*)])*
+            $(@[backend_attrs($($m_backend_attrs:meta),* $(,)*)])*
+            fn $method:ident($($args:ident : $args_ty:ty),* $(,)*) $(-> $ret_ty:ty)*;
+        )*}
+    )*) => {$(
+        $($(#[$mod_attrs])*)*
+        pub mod $mod {
+            $($(#[$call_attrs])*)*
+            $($(#[$data_attrs])*)*
+            #[allow(non_camel_case_types)]
+            pub enum Call {$(
+                $($(#[$m_call_attrs])*)*
+                $($(#[$m_data_attrs])*)*
+                $method{$(
+                    $args : $arg_ty
+                ),*}
+            ),*}
+
+            $($(#[$return_attrs])*)*
+            $($(#[$data_attrs])*)*
+            #[allow(non_camel_case_types)]
+            pub enum Return {$(
+                $($(#[$m_return_attrs])*)*
+                $($(#[$m_data_attrs])*)*
+                $method(($($ret_ty)*))
+            ),*}
 
             $(#[$attrs])*
-            pub trait $facade $(<$($ty_params),+>)*: ::api_facades::Facade
-                where $($($ty_params: Send + 'static,)+)* $($($ty_bounds)+)*
-            {
+            pub trait $intf: $crate::Interface<Call, Return> {$(
+                $(#[$m_attrs])*
+                #[allow(unreachable_patterns)]
+                fn $method(&self, $($args : $arg_ty),*) -> $crate::OneshotRx<($($ret_ty)*)> {
+                    use $crate::futures::Future;
+                    Box::new($crate::Interface::start_call(self, Call::$method{$($args),*})
+                        .map(|ret| match ret { Return::$method(r) => r, _ => unreachable!() }))
+                }
+            )*}
+
+            impl<__T> $intf for __T
+                where __T: $crate::Interface<Call, Return> + ?Sized
+            {}
+
+            $($(#[$backend_attrs])*)*
+            pub trait Backend {
                 $(
-                    $(#[$method_attrs])*
-                    fn $methods(&self, $($args: $arg_tys),*) -> ::api_facades::OneshotRx<($($ret_tys)*)>;
+                    $($(#[$m_backend_attrs])*)*
+                    fn $method(&mut self, $($args : $arg_ty,)*) $(-> $ret_ty)*;
                 )*
+            
             }
 
-            _api_facades!(@invoke_each [$($gen_macs),*] {
-                $module $facade [$([$($ty_params),+])*] [$([$($ty_bounds)+])*]
-                    $(
-                        $(#[$method_attrs])* 
-                        fn $methods($($args: $arg_tys),*) -> ($($ret_tys)*);
-                    )*
-            });
-        }
-        $vis use $module::$facade;
+            // TODO move this to api_bridges?
+            pub fn complete_call(__backend: &mut Backend, call: Call) -> Return {
+                match call {$(
+                    Call::$method{ $($args),* } => Return::$method(__backend.$method($($args,)*))
+                ),*}
+            }
 
-        _api_facades!{ /* @toplevel */ [] []
-            $($rest)*
-        }
-    };
-}
-
-#[macro_export]
-macro_rules! api_facades {
-    ($($tt:tt)*) => { 
-        _api_facades!{
-            /* @toplevel */ [] []
-            $($tt)*
-        }
-    };
-}
-
-#[macro_export]
-macro_rules! task_facade {
-    ($module:ident $facade:ident [$([$($ty_params:ident),+])*] [$([$($ty_bounds:tt)+])*]
-        $(
-            $(#[$method_attrs:meta])* fn $methods:ident($($args:ident: $arg_tys:ty),*) -> $ret_tys:ty;
-        )*
-    ) => {
-        pub trait TaskBackendAsync $(<$($ty_params),+>)*
-            where $($($ty_params: Send + 'static,)+)* $($($ty_bounds)+)*
-        {
-            $(fn $methods(&mut self, $($args: $arg_tys,)* __out: ::api_facades::OneshotTx<$ret_tys>);)*
-        }
-
-        pub trait TaskBackend $(<$($ty_params),+>)*
-            where $($($ty_params: Send + 'static,)+)* $($($ty_bounds)+)*
-        {
-            $(fn $methods(&mut self, $($args: $arg_tys,)*) -> $ret_tys;)*
-        }
-
-        impl<__T, $($($ty_params),+)*> TaskBackendAsync $(<$($ty_params),+>)* for __T
-            where __T: TaskBackend $(<$($ty_params),+>)*, $($($ty_params: Send + 'static,)+)* $($($ty_bounds)+)*
-        {
-            $(
-                fn $methods(&mut self, $($args: $arg_tys,)* __out: ::api_facades::OneshotTx<$ret_tys>){
-                    let _ = __out.send(self.$methods($($args)*));
-                }
-            )*
-        }
-
-        #[allow(non_camel_case_types)]
-        enum TaskCall $(<$($ty_params),+>)* 
-            where $($($ty_params: Send + 'static,)+)* $($($ty_bounds)+)*
-        {
-            $(
-                $methods{ 
-                    $($args: $arg_tys,)*
-                    __out: ::api_facades::OneshotTx<$ret_tys>,
-                },
-            )*
-        }
-
-        impl $(<$($ty_params),+>)* TaskCall $(<$($ty_params),+>)*
-            where $($($ty_params: Send + 'static,)+)* $($($ty_bounds)+)*
-        {
-            fn apply<__B>(self, __backend: &mut __B)
-                where __B: TaskBackendAsync $(<$($ty_params),+>)* + ?Sized
+            // TODO move this to api_bridges?
+            pub fn serve_call<S>(s: &mut S, backend: &mut Backend) -> $crate::futures::Poll<Option<()>, S::Error> 
+                where S: $crate::futures::Stream<Item = (Call, $crate::OneshotTx<Return>)>
             {
-                match self {
-                    $(TaskCall::$methods{ $($args,)* __out } => __backend.$methods($($args,)* __out),)*
-                }
+                use $crate::futures::Stream;
+                s.map(|(call, ret_tx)| { let _ = ret_tx.send(complete_call(backend, call)); }).poll()
             }
         }
-
-        pub struct TaskFacade $(<$($ty_params),+>)* 
-            where $($($ty_params: Send + 'static,)+)* $($($ty_bounds)+)*
-        {
-            tx: ::api_facades::futures::sync::mpsc::UnboundedSender<TaskCall $(<$($ty_params),+>)* >
-        }
-
-        impl $(<$($ty_params),+>)* Clone for TaskFacade $(<$($ty_params),+>)*
-            where $($($ty_params: Send + 'static,)+)* $($($ty_bounds)+)*
-        {
-            fn clone(&self) -> Self { Self{ tx: self.tx.clone() } }
-        }
-
-        impl $(<$($ty_params),+>)* ::api_facades::Facade for TaskFacade $(<$($ty_params),+>)*
-            where $($($ty_params: Send + 'static,)+)* $($($ty_bounds)+)*
-        {}
-
-        impl $(<$($ty_params),+>)* $facade $(<$($ty_params),+>)* for TaskFacade $(<$($ty_params),+>)*
-            where $($($ty_params: Send + 'static,)+)* $($($ty_bounds)+)*
-        {
-            $(
-                fn $methods(&self, $($args: $arg_tys,)*) -> ::api_facades::OneshotRx<$ret_tys> {
-                    use ::api_facades::futures::sync::oneshot;
-
-                    let (__tx, __rx) = oneshot::channel();
-                    // TODO what do with errors?
-                    let _ = self.tx.unbounded_send(TaskCall::$methods{ $($args,)* __out: __tx });
-                    __rx
-                }
-            )*
-        }
-
-        pub struct TaskServer $(<$($ty_params),+>)* 
-            where $($($ty_params: Send + 'static,)+)* $($($ty_bounds)+)*
-        {
-            rx: ::api_facades::futures::sync::mpsc::UnboundedReceiver<TaskCall $(<$($ty_params),+>)* >
-        }
-
-        impl $(<$($ty_params),+>)* TaskServer $(<$($ty_params),+>)*
-            where $($($ty_params: Send + 'static,)+)* $($($ty_bounds)+)*
-        {
-            pub fn serve<__B>(&mut self, backend: &mut __B) -> bool
-                where __B: TaskBackendAsync $(<$($ty_params),+>)* + ?Sized
-            {
-                use ::api_facades::futures::{Async, Stream};
-
-                match self.rx.poll() {
-                    Ok(Async::Ready(Some(call))) => { call.apply(backend); true }
-                    Ok(Async::Ready(None)) => false,
-                    Ok(Async::NotReady) => false,
-                    _ => unimplemented!() // TODO
-                }
-            }
-        }
-        
-        pub fn task_channel $(<$($ty_params),+>)* () -> (TaskFacade $(<$($ty_params),+>)*, TaskServer $(<$($ty_params),+>)*) 
-            where $($($ty_params: Send + 'static,)+)* $($($ty_bounds)+)*
-        {
-            use ::api_facades::futures::sync::mpsc;
-
-            let (tx, rx) = mpsc::unbounded();
-            (TaskFacade{ tx }, TaskServer{ rx })
-        }
-    }
+        pub use $mod::$intf;
+    )*}
 }
